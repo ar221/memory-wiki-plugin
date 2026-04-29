@@ -28,7 +28,7 @@ from scripts.memory_wiki.paths import wiki_root
 # ---------------------------------------------------------------------------
 
 # Top-level directories that hold compiled pages.
-_COMPILED_DIRS = ("entities", "concepts", "decisions", "incidents", "queries")
+_COMPILED_DIRS = ("entities", "concepts", "decisions", "operations", "projects", "incidents", "queries", "qa")
 
 # Frontmatter fields every compiled page must declare.
 _REQUIRED_FIELDS = ("title", "created", "updated", "type", "status")

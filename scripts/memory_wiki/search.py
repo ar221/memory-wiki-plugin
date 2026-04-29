@@ -20,7 +20,7 @@ from scripts.memory_wiki.paths import wiki_root
 # Constants
 # ---------------------------------------------------------------------------
 
-_COMPILED_DIRS = ("entities", "concepts", "decisions", "incidents", "queries")
+_COMPILED_DIRS = ("entities", "concepts", "decisions", "operations", "projects", "incidents", "queries", "qa")
 
 # Match [[target]] or [[target|label]] wikilink in index.md for descriptions.
 _INDEX_ENTRY_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]*)?\]\]\s*[—–-]\s*(.+)")
