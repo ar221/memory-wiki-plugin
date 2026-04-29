@@ -50,7 +50,6 @@ FILES=(
     "scripts/memory_wiki/ingest_artifact.py"
     "scripts/memory_wiki/promote.py"
     "plugins/memory/wiki/__init__.py"
-    "plugins/memory/wiki/plugin.yaml"
     "tools/memory_wiki_tool.py"
     "hermes_cli/memory_wiki.py"
     "tests/scripts/__init__.py"
