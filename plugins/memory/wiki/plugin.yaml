@@ -1,0 +1,7 @@
+name: wiki
+version: 1.0.0
+description: "Hermes compiled memory wiki — provides prefetch-based recall from synthesized markdown pages."
+pip_dependencies: []
+requires_env: []
+hooks:
+  - on_session_end
