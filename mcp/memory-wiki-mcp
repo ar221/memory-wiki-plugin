@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+"""memory-wiki-mcp — MCP stdio server exposing Agent Memory Wiki maintenance.
+
+Why this exists
+---------------
+Hermes agents already get *read* access to the wiki through memory-rag-mcp
+(semantic/FTS search over the whole vault, read-only). What they lacked was the
+*maintenance* surface: append a log entry, create a page, lint, build a context
+pack, ingest an artifact.
+
+Why it lives here and not in hermes-agent
+-----------------------------------------
+The original memory-wiki plugin copied files into the hermes-agent git clone.
+Upstream lands ~220 commits/day, and every `hermes update` reverts or cleans the
+clone — which is why that install rotted twice (2026-05-21, 2026-08-27). This
+server sits outside the clone and is registered via `mcp_servers` in
+config.yaml, the supported extension point. Updates cannot touch it, and it does
+not consume the single `memory.provider` slot (held by honcho).
+
+Design
+------
+Owns no traversal logic. Every operation shells out to the canonical scripts in
+<wiki>/tools/, so this server cannot drift from the wiki's real structure — the
+failure that made the old plugin return zero results (it scanned a "compiled"
+schema of entities/concepts/queries/... that no longer exists).
+
+Protocol: MCP over stdio, newline-delimited JSON-RPC 2.0. Stdlib only.
+"""
+
+from __future__ import annotations
+
+import codecs
+import datetime as _dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+SERVER_NAME = "memory-wiki"
+SERVER_VERSION = "1.0.0"
+DEFAULT_PROTOCOL = "2024-11-05"
+DEFAULT_WIKI = "/home/ayaz/Documents/Ayaz OS/05 Wiki/Agent Memory"
+
+# ---------------------------------------------------------------------------
+# Ingest safeguards
+#
+# Ported from the original plugin's tools/memory_wiki_tool.py (tests:
+# test_ingest_secret_rejected, test_ingest_credential_content_rejected,
+# test_ingest_disallowed_root_rejected) and then hardened. These matter more
+# here than they did there: this wiki is git-committed AND indexed by
+# memory-rag, so an ingested secret lands in version history and an embedding
+# store — two places it is painful to retract from.
+#
+# Three fixes over the original:
+#   1. Real home, not Path.home(). Hermes runs profile processes with HOME set
+#      to ~/.hermes/profiles/<profile> (its own cron wrapper uses pwd for this
+#      reason), so Path.home() would allowlist the wrong tree entirely.
+#   2. Bounded FULL-file scan, not the first 4 KiB. A secret at byte 5000 slipped
+#      through before, and files over 50 KiB were name-checked only.
+#   3. Fail CLOSED. Unreadable, oversized, or unscannable files are refused
+#      rather than waved through.
+# ---------------------------------------------------------------------------
+
+# Filename-only heuristic. Names, not content — see _scan_for_credentials.
+_SECRET_SUBSTRINGS = ("auth", "secret", "token", "password", "credential", ".env")
+
+# Largest file we will content-scan. Anything bigger cannot be verified, so it
+# is refused rather than trusted.
+_MAX_SCAN_BYTES = 8 * 1024 * 1024
+_CHUNK = 256 * 1024
+
+_CREDENTIAL_CONTENT_RE = re.compile(
+    r"(ghp_[A-Za-z0-9]{36}|sk-[A-Za-z0-9]{32,}|Bearer\s+[A-Za-z0-9._-]{20,}"
+    r"|-----BEGIN [A-Z ]+-+|password\s*[:=]\s*\S+)",
+    re.IGNORECASE,
+)
+
+
+def _real_home() -> Path:
+    """The OS account home, ignoring a profile-scoped $HOME."""
+    try:
+        import pwd
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except Exception:
+        return Path(os.path.expanduser("~"))
+
+
+def _ingest_allowed_roots() -> tuple:
+    """Computed per call so a mutated $HOME cannot widen the allowlist."""
+    h = _real_home()
+    return (
+        h / ".hermes" / "artifacts",
+        h / ".hermes" / "cron" / "output",
+        h / "Downloads",
+        h / "Documents",
+        h / "Desktop",
+    )
+
+
+def _looks_like_secret(filename: str) -> bool:
+    lower = filename.lower()
+    return any(sub in lower for sub in _SECRET_SUBSTRINGS)
+
+
+def _scan_for_credentials(path: Path) -> Optional[str]:
+    """Scan the whole file (bounded) for credential patterns. FAILS CLOSED.
+
+    Returns None when the file is verified clean, else a reason string.
+
+    Two things this deliberately does NOT do:
+      * It never echoes any part of the match. Reporting even a prefix would
+        copy live credential material into agent context and logs — the very
+        leak this guard exists to prevent. Only the pattern class is named.
+      * It does not lossily decode binary. `errors="replace"` silently mangles
+        non-UTF-8 bytes, so a secret in a binary container or UTF-16 text would
+        never match. Binary input is refused instead of scanned badly.
+
+    Chunks overlap by 512 bytes so a pattern straddling a boundary is caught.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return f"could not stat the file ({exc.__class__.__name__}); refusing rather than guessing"
+
+    if size > _MAX_SCAN_BYTES:
+        return (f"file is {size} bytes, above the {_MAX_SCAN_BYTES}-byte scan limit, "
+                f"so it cannot be verified clean")
+
+    overlap = 512
+    tail = ""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    try:
+        with path.open("rb") as fh:
+            while True:
+                buf = fh.read(_CHUNK)
+                if not buf:
+                    break
+                if b"\x00" in buf:
+                    return ("file appears to be binary (NUL bytes), which cannot be "
+                            "text-scanned reliably; refusing rather than guessing")
+                try:
+                    # Incremental decode holds partial multibyte sequences across
+                    # chunk boundaries, so a legitimate UTF-8 file never trips the
+                    # non-UTF-8 refusal below.
+                    chunk = decoder.decode(buf)
+                except UnicodeDecodeError:
+                    return ("file is not valid UTF-8 text, so it cannot be scanned "
+                            "for credentials; refusing rather than guessing")
+                text = tail + chunk
+                if _CREDENTIAL_CONTENT_RE.search(text):
+                    return ("content matches a credential pattern (token, bearer header, "
+                            "private-key block, or password assignment) — match text "
+                            "withheld deliberately")
+                tail = text[-overlap:]
+            try:
+                decoder.decode(b"", final=True)
+            except UnicodeDecodeError:
+                return ("file ends mid-UTF-8-sequence, so it cannot be fully scanned; "
+                        "refusing rather than guessing")
+    except OSError as exc:
+        return f"could not read the file ({exc.__class__.__name__}); refusing rather than guessing"
+
+    return None
+
+
+def _ingest_refusal(src: Path) -> Optional[str]:
+    """Return a refusal message if this file must not enter the wiki."""
+    try:
+        resolved = src.resolve()
+    except OSError as exc:
+        return f"error: could not resolve {src}: {exc}"
+
+    roots = _ingest_allowed_roots()
+    if not any(
+        resolved == r or r in resolved.parents
+        for r in (x.resolve() for x in roots if x.exists())
+    ):
+        return ("error: refusing to ingest from a disallowed root: "
+                f"{resolved}\nallowed roots: " + ", ".join(str(r) for r in roots))
+
+    if _looks_like_secret(resolved.name):
+        return (f"error: refusing to ingest {resolved.name} — the filename looks "
+                f"credential-bearing (matched one of: {', '.join(_SECRET_SUBSTRINGS)}). "
+                f"Store a safe summary and the path instead.")
+
+    reason = _scan_for_credentials(resolved)
+    if reason:
+        return (f"error: refusing to ingest {resolved.name} — {reason}. This wiki is "
+                f"git-committed and indexed by memory-rag; store a safe summary and "
+                f"the path instead.")
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Wiki resolution
+# ---------------------------------------------------------------------------
+
+def wiki_root() -> Path:
+    env = os.environ.get("AGENT_MEMORY_WIKI")
+    if env:
+        return Path(env).expanduser().resolve()
+    home = os.environ.get("HERMES_HOME")
+    if home:
+        cand = Path(home) / "memory-wiki"
+        if cand.exists():
+            return cand.resolve()
+    cand = Path.home() / ".hermes" / "memory-wiki"
+    if cand.exists():
+        return cand.resolve()
+    return Path(DEFAULT_WIKI).resolve()
+
+
+def _run_tool(script: str, args: List[str]) -> str:
+    root = wiki_root()
+    exe = root / "tools" / script
+    if not exe.is_file():
+        return f"error: {script} not found under {root / 'tools'}"
+    env = dict(os.environ)
+    env["AGENT_MEMORY_WIKI"] = str(root)
+    # Run via the tool's own shebang when it is executable. Hardcoding
+    # sys.executable silently assumes every wiki tool is Python; the directory
+    # already mixes languages (e.g. cleanup-tmp-daily.sh elsewhere in the tree),
+    # and a future shell tool would break. Fall back to the current interpreter
+    # only when the file is not executable.
+    argv = [str(exe), *args] if os.access(exe, os.X_OK) else [sys.executable, str(exe), *args]
+    proc = subprocess.run(
+        argv,
+        cwd=str(root), env=env, capture_output=True, text=True, timeout=180,
+    )
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if proc.returncode == 1 and script == "wiki-search" and not out:
+        return ("no matches. wiki-search is a case-sensitive REGEX over the whole "
+                "wiki, not a phrase search — try one distinctive term, or a regex "
+                "like 'artifact.*retention', or alternation 'a|b'.")
+    parts = [p for p in (out, err) if p]
+    body = "\n".join(parts) if parts else "(no output)"
+    if proc.returncode not in (0, 1):
+        body = f"[exit {proc.returncode}]\n{body}"
+    return body
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
+TOOLS: List[Dict[str, Any]] = [
+    {
+        "name": "wiki_path",
+        "description": "Print the resolved Agent Memory Wiki root path.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "wiki_search",
+        "description": (
+            "Case-sensitive REGEX search over wiki markdown (not phrase search). "
+            "Use one distinctive term or a regex like 'artifact.*retention'. Does not "
+            "rank results and does not exclude generated zones — scope with glob "
+            "'wiki/**/*.md' or '!wiki/{skills,capabilities}/**'. For fuzzy/semantic "
+            "recall prefer the memory-rag tools."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search regex"},
+                "glob": {"type": "string", "description": "Optional file scope glob"},
+                "limit": {"type": "integer", "description": "Max matching lines"},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "wiki_read",
+        "description": "Read a wiki page. Path is relative to the wiki root, e.g. 'wiki/workflows/artifact-retention.md'.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"page": {"type": "string"}},
+            "required": ["page"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "wiki_lint",
+        "description": (
+            "Run wiki-check-links, wiki-orphans and wiki-lint. NOTE: only 2 of the 7 "
+            "designed checks are mechanized (broken wikilinks, orphan pages). Stale "
+            "pages, contradictions, missing citations, open-loop promotion and "
+            "duplicate concepts require an agent reading pages — a clean run is NOT "
+            "a health check."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "wiki_context_pack",
+        "description": "Build a bounded markdown context pack for a topic and return its path.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string"},
+                "max_files": {"type": "integer", "description": "Default 8"},
+            },
+            "required": ["topic"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "wiki_log",
+        "description": (
+            "Append a parseable entry to the wiki log. Chronology is part of the memory "
+            "system — log every durable change."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "type": {"type": "string", "description": "ingest | query | lint | build"},
+                "title": {"type": "string"},
+                "bullets": {"type": "array", "items": {"type": "string"}},
+                "date": {"type": "string", "description": "YYYY-MM-DD (default today)"},
+            },
+            "required": ["type", "title"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "wiki_new_page",
+        "description": (
+            "Create a new wiki page from the class template. Search first and prefer "
+            "updating an existing page over creating a duplicate."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["agent", "person", "project", "system", "tool",
+                             "workflow", "decision", "concept", "incident"],
+                },
+                "title": {"type": "string"},
+                "summary": {"type": "string"},
+            },
+            "required": ["kind", "title"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "wiki_ingest_artifact",
+        "description": (
+            "Copy a file into the wiki's artifacts/ directory and append a log entry. "
+            "The destination is date-prefixed and never overwrites — a colliding name "
+            "gets a numeric suffix. REFUSES: files outside the source allowlist "
+            "(~/.hermes/artifacts, ~/.hermes/cron/output, ~/Downloads, ~/Documents, "
+            "~/Desktop); credential-bearing filenames; and any file whose full contents "
+            "match a credential pattern. Binary, non-UTF-8, unreadable and oversized "
+            "(>8MiB) files are refused as unverifiable. This wiki is git-committed and "
+            "indexed by memory-rag — never ingest secrets; store a safe summary and the "
+            "path instead."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute path of the file to ingest"},
+                "note": {"type": "string"},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+]
+
+
+def call_tool(name: str, args: Dict[str, Any]) -> str:
+    root = wiki_root()
+
+    if name == "wiki_path":
+        return str(root)
+
+    if name == "wiki_search":
+        extra: List[str] = []
+        if args.get("glob"):
+            extra += ["--glob", str(args["glob"])]
+        if args.get("limit"):
+            extra += ["--max", str(int(args["limit"]))]
+        return _run_tool("wiki-search", [str(args["query"]), *extra])
+
+    if name == "wiki_read":
+        target = (root / str(args["page"])).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            return f"error: refusing to read outside the wiki root: {target}"
+        if not target.is_file() and target.suffix != ".md":
+            alt = target.with_suffix(".md")
+            if alt.is_file():
+                target = alt
+        if not target.is_file():
+            return f"error: no such page: {target}"
+        return target.read_text(encoding="utf-8")
+
+    if name == "wiki_lint":
+        chunks = [f"$ {s}\n{_run_tool(s, [])}" for s in
+                  ("wiki-check-links", "wiki-orphans", "wiki-lint")]
+        chunks.append(
+            "NOTE: 2 of 7 checks are mechanized. Stale pages, contradictions, "
+            "missing citations, open-loop promotion and duplicate concepts still "
+            "require an agent pass."
+        )
+        return "\n\n".join(chunks)
+
+    if name == "wiki_context_pack":
+        extra = ["--max-files", str(int(args["max_files"]))] if args.get("max_files") else []
+        return _run_tool("wiki-context-pack", [str(args["topic"]), *extra])
+
+    if name == "wiki_log":
+        argv = [str(args["type"]), str(args["title"])]
+        for b in args.get("bullets") or []:
+            argv += ["-b", str(b)]
+        if args.get("date"):
+            argv += ["--date", str(args["date"])]
+        return _run_tool("wiki-log", argv)
+
+    if name == "wiki_new_page":
+        argv = [str(args["kind"]), str(args["title"])]
+        if args.get("summary"):
+            argv += ["--summary", str(args["summary"])]
+        return _run_tool("wiki-new-page", argv)
+
+    if name == "wiki_ingest_artifact":
+        src = Path(str(args["path"])).expanduser()
+        if not src.is_file():
+            return f"error: no such file: {src}"
+        refusal = _ingest_refusal(src)
+        if refusal:
+            return refusal
+        dest_dir = root / "artifacts"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        # Never overwrite. Date-prefix like the original plugin, then add a
+        # numeric suffix on collision. An agent-facing overwrite flag is a
+        # silent-data-loss hazard in a git-committed corpus.
+        today = _dt.date.today().isoformat()
+        dest = dest_dir / f"{today}-{src.name}"
+        if dest.exists():
+            stem, ext = Path(src.name).stem, Path(src.name).suffix
+            n = 2
+            while (dest_dir / f"{today}-{stem}-{n}{ext}").exists():
+                n += 1
+            dest = dest_dir / f"{today}-{stem}-{n}{ext}"
+        shutil.copy2(src, dest)
+        bullets = ["-b", f"Ingested `artifacts/{dest.name}` from `{src}`."]
+        if args.get("note"):
+            bullets += ["-b", str(args["note"])]
+        log = _run_tool("wiki-log", ["ingest", f"Artifact: {dest.name}", *bullets])
+        return f"ingested -> {dest}\n{log}"
+
+    return f"error: unknown tool {name!r}"
+
+
+# ---------------------------------------------------------------------------
+# JSON-RPC / MCP plumbing
+# ---------------------------------------------------------------------------
+
+def _send(msg: Dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(msg, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def _result(req_id: Any, result: Dict[str, Any]) -> None:
+    _send({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+
+def _error(req_id: Any, code: int, message: str) -> None:
+    _send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
+
+
+def handle(msg: Dict[str, Any]) -> None:
+    method = msg.get("method")
+    req_id = msg.get("id")
+    params = msg.get("params") or {}
+
+    if method == "initialize":
+        proto = params.get("protocolVersion") or DEFAULT_PROTOCOL
+        _result(req_id, {
+            "protocolVersion": proto,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+        })
+        return
+
+    if method in ("notifications/initialized", "initialized"):
+        return
+
+    if method == "ping":
+        _result(req_id, {})
+        return
+
+    if method == "tools/list":
+        _result(req_id, {"tools": TOOLS})
+        return
+
+    if method == "tools/call":
+        name = params.get("name") or ""
+        args = params.get("arguments") or {}
+        try:
+            text = call_tool(name, args)
+            is_err = text.startswith("error:")
+        except Exception as exc:  # never kill the server on one bad call
+            text = f"error: {type(exc).__name__}: {exc}"
+            is_err = True
+        _result(req_id, {"content": [{"type": "text", "text": text}], "isError": is_err})
+        return
+
+    if req_id is not None:
+        _error(req_id, -32601, f"method not found: {method}")
+
+
+def main() -> int:
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(msg, list):
+            for m in msg:
+                handle(m)
+        elif isinstance(msg, dict):
+            handle(msg)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (BrokenPipeError, KeyboardInterrupt):
+        raise SystemExit(0)
