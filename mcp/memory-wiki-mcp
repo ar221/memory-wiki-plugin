@@ -15,7 +15,7 @@ Upstream lands ~220 commits/day, and every `hermes update` reverts or cleans the
 clone — which is why that install rotted twice (2026-05-21, 2026-08-27). This
 server sits outside the clone and is registered via `mcp_servers` in
 config.yaml, the supported extension point. Updates cannot touch it, and it does
-not consume the single `memory.provider` slot (held by honcho).
+not consume the single `memory.provider` slot.
 
 Design
 ------
